@@ -3,7 +3,7 @@
 
 The output is a concatenated gzip stream. Each gzip member contains one
 pickled record: first metadata, then one record per completed batch. This
-keeps the output compact while allowing batch-level checkpointing.
+keeps the output compact while allowing batch-level writes.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import argparse
 import csv
 import gzip
 import hashlib
-import json
 import os
 import pickle
 import socket
@@ -282,108 +281,65 @@ def experiment_config(
     }
 
 
-def config_fingerprint(config: dict[str, Any]) -> str:
-    encoded = json.dumps(
-        config,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def state_path_for(output_path: Path) -> Path:
+def legacy_state_path_for(output_path: Path) -> Path:
     return Path(f"{output_path}.state.json")
 
 
-def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+def write_gzip_record(
+    path: Path,
+    record: dict[str, Any],
+    mode: str = "ab",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(f"{path}.tmp")
-    with temporary.open("w", encoding="utf-8") as state_file:
-        json.dump(data, state_file, ensure_ascii=False, indent=2)
-        state_file.flush()
-        os.fsync(state_file.fileno())
-    os.replace(temporary, path)
-
-
-def append_gzip_record(path: Path, record: dict[str, Any]) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("ab") as raw_file:
+    with path.open(mode) as raw_file:
         with gzip.GzipFile(fileobj=raw_file, mode="wb") as compressed:
             pickle.dump(record, compressed, protocol=pickle.HIGHEST_PROTOCOL)
         raw_file.flush()
         os.fsync(raw_file.fileno())
-        return raw_file.tell()
 
 
-def initialize_or_resume(
+def existing_output_paths(output_path: Path) -> list[Path]:
+    return [
+        path
+        for path in (output_path, legacy_state_path_for(output_path))
+        if path.exists()
+    ]
+
+
+def ensure_output_available(output_path: Path, overwrite: bool) -> None:
+    existing = existing_output_paths(output_path)
+    if existing and not overwrite:
+        paths = ", ".join(str(path) for path in existing)
+        raise FileExistsError(
+            f"Output already exists: {paths}; pass --overwrite to replace it"
+        )
+
+
+def initialize_output(
     output_path: Path,
     config: dict[str, Any],
     overwrite: bool,
-) -> int:
-    state_path = state_path_for(output_path)
+) -> None:
+    ensure_output_available(output_path, overwrite)
     if overwrite:
         output_path.unlink(missing_ok=True)
-        state_path.unlink(missing_ok=True)
+        legacy_state_path_for(output_path).unlink(missing_ok=True)
 
-    output_exists = output_path.exists()
-    state_exists = state_path.exists()
-    if output_exists != state_exists:
-        raise RuntimeError(
-            "Output and checkpoint state are inconsistent. Pass --overwrite "
-            f"to restart: {output_path}, {state_path}"
-        )
-
-    fingerprint = config_fingerprint(config)
-    if not output_exists:
-        metadata = {
+    write_gzip_record(
+        output_path,
+        {
             "type": "metadata",
             "created_at": time.time(),
             "hostname": socket.gethostname(),
             "config": config,
-        }
-        valid_size = append_gzip_record(output_path, metadata)
-        atomic_write_json(
-            state_path,
-            {
-                "format_version": OUTPUT_FORMAT_VERSION,
-                "config_fingerprint": fingerprint,
-                "completed_count": 0,
-                "valid_size": valid_size,
-            },
-        )
-        return 0
-
-    with state_path.open("r", encoding="utf-8") as state_file:
-        state = json.load(state_file)
-    if state.get("format_version") != OUTPUT_FORMAT_VERSION:
-        raise RuntimeError("Checkpoint format version does not match this script")
-    if state.get("config_fingerprint") != fingerprint:
-        raise RuntimeError(
-            "Existing output was created with a different model, dataset, "
-            "prompt, sampling configuration, or vLLM configuration. "
-            "Pass --overwrite to restart."
-        )
-
-    valid_size = int(state["valid_size"])
-    actual_size = output_path.stat().st_size
-    if actual_size < valid_size:
-        raise RuntimeError(
-            f"Output is shorter than its checkpoint ({actual_size} < {valid_size})"
-        )
-    if actual_size != valid_size:
-        with output_path.open("r+b") as output_file:
-            output_file.truncate(valid_size)
-            output_file.flush()
-            os.fsync(output_file.fileno())
-    return int(state["completed_count"])
+        },
+        mode="xb",
+    )
 
 
 def save_batch(
     output_path: Path,
-    config: dict[str, Any],
     samples: list[dict[str, Any]],
-    completed_count: int,
 ) -> None:
     batch_record = {
         "type": "batch",
@@ -391,16 +347,7 @@ def save_batch(
         "end_index": samples[-1]["index"] + 1,
         "samples": samples,
     }
-    valid_size = append_gzip_record(output_path, batch_record)
-    atomic_write_json(
-        state_path_for(output_path),
-        {
-            "format_version": OUTPUT_FORMAT_VERSION,
-            "config_fingerprint": config_fingerprint(config),
-            "completed_count": completed_count,
-            "valid_size": valid_size,
-        },
-    )
+    write_gzip_record(output_path, batch_record)
 
 
 def default_output_path(args: argparse.Namespace) -> Path:
@@ -464,6 +411,9 @@ def run(args: argparse.Namespace) -> Path:
     if not sources:
         raise ValueError(f"No source sentences found in {input_path}")
 
+    output_path = args.output or default_output_path(args)
+    ensure_output_available(output_path, args.overwrite)
+
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tp_size,
@@ -495,16 +445,13 @@ def run(args: argparse.Namespace) -> Path:
         len(sources),
         sampling_config,
     )
-    output_path = args.output or default_output_path(args)
-    completed_count = initialize_or_resume(
+    initialize_output(
         output_path,
         config,
         args.overwrite,
     )
-    if completed_count > len(sources):
-        raise RuntimeError("Checkpoint contains more samples than the input")
 
-    for start in range(completed_count, len(sources), args.batch_size):
+    for start in range(0, len(sources), args.batch_size):
         batch = sources[start : start + args.batch_size]
         prompts = [
             build_prompt(
@@ -534,7 +481,7 @@ def run(args: argparse.Namespace) -> Path:
                 }
             )
         completed_count = start + len(batch)
-        save_batch(output_path, config, samples, completed_count)
+        save_batch(output_path, samples)
         print(f"Saved {completed_count}/{len(sources)} samples", flush=True)
 
     return output_path
