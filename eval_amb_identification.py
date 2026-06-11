@@ -163,7 +163,8 @@ def extract_choice_probabilities(
     tokenizer: Any,
     choices: tuple[str, ...] = CHOICES,
 ) -> dict[str, Any]:
-    log_probs: dict[str, float | None] = {choice: None for choice in choices}
+    # Use -inf for missing tokens; math.exp(-inf) == 0.0
+    log_probs: dict[str, float] = {choice: float("-inf") for choice in choices}
 
     for token_id, logprob in position_logprobs.items():
         choice = token_choice(
@@ -177,23 +178,20 @@ def extract_choice_probabilities(
         current = log_probs[choice]
         # Multiple token forms such as "是" and " 是" may represent one choice.
         log_probs[choice] = (
-            value if current is None else float(np.logaddexp(current, value))
+            value if current == float("-inf") else float(np.logaddexp(current, value))
         )
 
     raw_probs = {
-        choice: math.exp(value) if value is not None else None
+        choice: math.exp(value)
         for choice, value in log_probs.items()
     }
-    normalized_probs: dict[str, float | None] = {
-        choice: None for choice in choices
-    }
-    if all(value is not None for value in log_probs.values()):
-        denominator = sum(value for value in raw_probs.values() if value is not None)
-        if denominator > 0:
-            normalized_probs = {
-                choice: raw_probs[choice] / denominator
-                for choice in choices
-            }
+    normalized_probs: dict[str, float] = {choice: 0.0 for choice in choices}
+    denominator = sum(raw_probs.values())
+    if denominator > 0:
+        normalized_probs = {
+            choice: raw_probs[choice] / denominator
+            for choice in choices
+        }
 
     return {
         "raw": raw_probs,
