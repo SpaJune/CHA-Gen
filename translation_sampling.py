@@ -9,6 +9,7 @@ keeps the output compact while allowing batch-level checkpointing.
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import hashlib
 import json
@@ -194,20 +195,48 @@ def serialize_completion(completion: Any, tokenizer: Any) -> dict[str, Any]:
     }
 
 
-def load_source_lines(path: Path) -> list[dict[str, Any]]:
+def dataset_path(name: str) -> Path:
+    if name == "CHA-Gen":
+        return Path("dataset/CHA-Gen/corpus.csv")
+    raise ValueError(f"Unsupported dataset: {name}")
+
+
+def load_dataset(name: str) -> tuple[Path, list[dict[str, Any]]]:
+    path = dataset_path(name)
     records = []
-    with path.open("r", encoding="utf-8") as source_file:
-        for line_number, line in enumerate(source_file, start=1):
-            source = line.rstrip("\r\n")
-            if source.strip():
-                records.append(
-                    {
-                        "index": len(records),
-                        "line_number": line_number,
-                        "src": source,
-                    }
+    with path.open("r", encoding="utf-8", newline="") as dataset_file:
+        reader = csv.DictReader(dataset_file)
+        required_columns = {"sent", "ambiguity"}
+        missing_columns = required_columns - set(reader.fieldnames or ())
+        if missing_columns:
+            raise ValueError(
+                f"Dataset is missing columns: {sorted(missing_columns)}"
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            source = row["sent"]
+            if not source or not source.strip():
+                raise ValueError(f"Empty sentence at {path}:{row_number}")
+            try:
+                ambiguity = int(row["ambiguity"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid ambiguity label at {path}:{row_number}"
+                ) from exc
+            if ambiguity not in (0, 1):
+                raise ValueError(
+                    f"Unexpected ambiguity label at {path}:{row_number}: "
+                    f"{ambiguity}"
                 )
-    return records
+            records.append(
+                {
+                    "index": len(records),
+                    "row_number": row_number,
+                    "src": source,
+                    "ambiguity": ambiguity,
+                }
+            )
+    return path, records
 
 
 def sha256_file(path: Path) -> str:
@@ -240,8 +269,8 @@ def experiment_config(
             "qwen3_thinking": False,
             "stop": None,
         },
-        "input_path": str(input_path.resolve()),
-        "input_sha256": sha256_file(input_path),
+        "dataset_path": str(input_path.resolve()),
+        "dataset_sha256": sha256_file(input_path),
         "source_count": source_count,
         "sampling_params": sampling_config,
         "llm_config": {
@@ -331,7 +360,7 @@ def initialize_or_resume(
         raise RuntimeError("Checkpoint format version does not match this script")
     if state.get("config_fingerprint") != fingerprint:
         raise RuntimeError(
-            "Existing output was created with a different model, input, "
+            "Existing output was created with a different model, dataset, "
             "prompt, sampling configuration, or vLLM configuration. "
             "Pass --overwrite to restart."
         )
@@ -394,19 +423,22 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "base", "instruct"),
         default="auto",
     )
-    parser.add_argument("--input", required=True, help="One source sentence per line")
-    parser.add_argument("--dataset", required=True, help="Dataset name for output")
+    parser.add_argument(
+        "--dataset",
+        default="CHA-Gen",
+        help="Dataset to load (currently supported: CHA-Gen)",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--max_tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument(
         "--logprobs",
         type=int,
-        default=100,
+        default=20,
         help="Number of top token logprobs retained at each generated position",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -428,10 +460,9 @@ def parse_args() -> argparse.Namespace:
 def run(args: argparse.Namespace) -> Path:
     from vllm import LLM, SamplingParams
 
-    input_path = Path(args.input)
-    sources = load_source_lines(input_path)
+    input_path, sources = load_dataset(args.dataset)
     if not sources:
-        raise ValueError(f"No non-empty source lines found in {input_path}")
+        raise ValueError(f"No source sentences found in {input_path}")
 
     llm = LLM(
         model=args.model,
