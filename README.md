@@ -2,12 +2,14 @@
 
 ## Output Data Format
 
-`translation_sampling.py` generates translation sampling data in **concatenated gzip stream** format (`.pkl.gz`), where each gzip member contains one pickle-serialized record.
+`translation_analysis/translation_sampling.py` generates translation sampling
+data in **concatenated gzip stream** format (`.pkl.gz`), where each gzip member
+contains one pickle-serialized record.
 
 ### Default Output Path
 
 ```
-translation_outputs/prompt2/CHA-Gen/{model_tag}.pkl.gz
+translation_analysis/translation_outputs/prompt2/CHA-Gen/{model_tag}.pkl.gz
 ```
 
 ### Record Types
@@ -124,13 +126,35 @@ Interrupted runs are not resumed. If the output path already exists, the
 script raises `FileExistsError`. Pass `--overwrite` to replace the existing
 output and restart from the beginning.
 
+## Extracted Analysis Data
+
+Create lightweight Parquet files for repeated analysis:
+
+```bash
+python translation_analysis/data_extraction.py
+```
+
+The output mirrors the raw directory structure:
+
+```text
+translation_analysis/extracted_outputs/prompt2/CHA-Gen/{model_tag}.parquet
+```
+
+Each row represents one translation candidate. The Parquet files retain source
+metadata, raw and conservatively processed text, processing status, and finish
+reason. Token IDs and token-level logprobs remain only in the raw `.pkl.gz`
+archive. Existing Parquet files are skipped unless `--overwrite` is passed.
+
 ### Reading Example
 
 ```python
 import gzip
 import pickle
 
-with open("output.pkl.gz", "rb") as f:
+with open(
+    "translation_analysis/translation_outputs/prompt2/CHA-Gen/output.pkl.gz",
+    "rb",
+) as f:
     while True:
         try:
             with gzip.GzipFile(fileobj=f, mode="rb") as gz:
